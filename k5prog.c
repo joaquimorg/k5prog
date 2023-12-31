@@ -1,7 +1,7 @@
-/* Quansheng UV-K5 EEPROM programmer v0.4 
+/* Quansheng UV-K5 EEPROM programmer v0.9 
  * (c) 2023 Jacek Lipkowski <sq5bpf@lipkowski.org>
  *
- * This program can read and write the eeprom of Quansheng UVK5 Mark II 
+ * This program can read and write the EEPROM of Quansheng UVK5 Mark II 
  * and probably other similar radios via the serial port. 
  *
  * It can read/write arbitrary data, and might be useful for reverse
@@ -50,7 +50,7 @@
 #include <stdint.h>
 #include "uvk5.h"
 
-#define VERSION "Quansheng UV-K5 EEPROM programmer v0.4 (c) 2023 Jacek Lipkowski <sq5bpf@lipkowski.org>"
+#define VERSION "Quansheng UV-K5 EEPROM programmer v0.9 (c) 2023 Jacek Lipkowski <sq5bpf@lipkowski.org>"
 
 #define MODE_NONE 0
 #define MODE_READ 1
@@ -79,6 +79,9 @@
 #define DEFAULT_FILE_NAME "k5_eeprom.raw"
 #define DEFAULT_FLASH_NAME "k5_flash.raw"
 
+/* the vendor flasher sends the firmware version like "2.01.23" */
+#define DEFAULT_FLASH_VERSION "*.01.23"
+
 /* globals */
 speed_t ser_speed=B38400;
 char *ser_port=DEFAULT_SERIAL_PORT;
@@ -86,6 +89,8 @@ int verbose=0;
 int mode=MODE_NONE;
 char *file=DEFAULT_FILE_NAME;
 char *flash_file=DEFAULT_FLASH_NAME;
+
+char flash_version_string[8]=DEFAULT_FLASH_VERSION;
 
 int write_offset=0;
 int write_length=-1;
@@ -105,8 +110,8 @@ unsigned char uvk5_hello2[]={0x14, 0x05, 0x04, 0x00, 0x9f, 0x25, 0x5a, 0x64};
 
 /* commands:
  * 0x14 - hello
- * 0x1b - read eeprom
- * 0x1d - write eeprom
+ * 0x1b - read EEPROM
+ * 0x1d - write EEPROM
  * 0xdd - reset radio
  */
 
@@ -138,7 +143,7 @@ void hdump(unsigned char *buf,int len)
 	unsigned char sss;
 	char hexz[]="0123456789abcdef";
 
-	int lasttmp;
+	int lasttmp=0;
 
 	printf("\n0x%6.6x |0 |1 |2 |3 |4 |5 |6 |7 |8 |9 |a |b |c |d |e |f |\n",len);
 	printf("---------+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+------------\n");
@@ -224,6 +229,13 @@ int read_timeout(int fd, unsigned char *buf, int maxlen, int timeout)
 
 		ret=select(fd+1,&rfd,0,0,&tv);
 
+		if (ret==0)  {
+			if(timeout) /* Only print if we requested a timeout */
+				fprintf(stderr,"read_timeout\n");
+			/* error or timeout */
+			break;
+		}
+
 		if (FD_ISSET(fd,&rfd)) {
 			nr=read(fd,buf,maxlen);
 
@@ -231,17 +243,9 @@ int read_timeout(int fd, unsigned char *buf, int maxlen, int timeout)
 			buf=buf+nr;
 			if (nr>=0) maxlen=maxlen-nr;
 			if (maxlen==0) break;
-		} 
-
-
-		if (ret==0)  {
-			fprintf(stderr,"read_timeout\n");
-			/* error albo timeout */
-			break;
 		}
-
 	}
-	if (verbose>2) {
+	if (verbose>2 && len > 0) {
 		printf("RXRXRX:\n");
 		hdump(buf2,len);
 	}
@@ -259,7 +263,7 @@ void destroy_k5_struct(struct k5_command *cmd)
 }
 
 /* ripped from https://mdfs.net/Info/Comp/Comms/CRC16.htm */
-uint16_t crc16xmodem(char *addr, int num, int crc)
+uint16_t crc16xmodem(unsigned char *addr, int num, int crc)
 {
 #define poly 0x1021
 	int i;
@@ -409,7 +413,6 @@ int k5_send_buf(int fd,unsigned char *buf,int len) {
 /* receive a response, deobfuscate it */
 struct k5_command *k5_receive(int fd,int tmout) {
 	unsigned char buf[4];
-	unsigned char buf2[2048];
 	struct k5_command *cmd;
 	int len;
 
@@ -423,11 +426,22 @@ struct k5_command *k5_receive(int fd,int tmout) {
 		return(0);
 	}
 
+    /* During plugging in etc we can receive a single byte.
+     * Handle this case here. */
+    if (len != sizeof(buf))
+    {
+        fprintf(stderr,"k5_receive: got %d expected %ld\n", len, sizeof(buf));
+        return(0);
+    }
 
-	if ((buf[0]!=0xab)||(buf[1]!=0xcd)) {
-		fprintf(stderr,"k5_receive: bad magic number\n");
-		return(0);
-	}
+    if ((buf[0]!=0xab)||(buf[1]!=0xcd)) {
+        fprintf(stderr,"k5_receive: bad magic number\n");
+        /* Assume we are out of sync and flush rx buffer by reading everything.
+         * This works because the boot message is repeated. */
+        while (len>0)
+            len =read_timeout(fd,(unsigned char *)&buf,sizeof(buf),10000);
+        return(0);
+    }
 
 	if (buf[3]!=0) {
 		fprintf(stderr,"k5_receive: it seems that byte 3 can be something else than 0, please notify the author\n");
@@ -451,11 +465,10 @@ struct k5_command *k5_receive(int fd,int tmout) {
 	return(cmd);
 }
 /******************************/
-/*  eeprom read/write support */
+/*  EEPROM read/write support */
 /******************************/
 int k5_readmem(int fd, unsigned char *buf, unsigned char maxlen, int offset)
 {
-	int l;
 	unsigned char readmem[sizeof(uvk5_readmem1)];
 
 
@@ -486,7 +499,6 @@ int k5_readmem(int fd, unsigned char *buf, unsigned char maxlen, int offset)
 
 int k5_writemem(int fd, unsigned char *buf, unsigned char len, int offset)
 {
-	int l;
 	unsigned char writemem[512];
 
 
@@ -534,15 +546,13 @@ int k5_writemem(int fd, unsigned char *buf, unsigned char len, int offset)
 /* reset the radio */
 int k5_reset(int fd)
 {
-	int l;
 	int r;
-	struct k5_command *cmd;
 
 	if (verbose>1) printf("@@@@@@@@@@@@@@@@@@    reset\n");
 	r=k5_send_buf(fd,uvk5_reset,sizeof(uvk5_reset));
 	return(r);
 }	
-/*  end of eeprom read/write support */
+/*  end of EEPROM read/write support */
 
 
 /******************************/
@@ -564,8 +574,9 @@ int wait_flash_message(int fd,int ntimes) {
 		cmd=k5_receive(fd,10000);
 
 		if (!cmd) {
-			printf("wait_flash_message: timeout\n");
-			continue; 
+			/* No need to print, k5_receive already printed why it failed */
+			//printf("wait_flash_message: timeout\n");
+			continue;
 		}
 
 		k5_hexdump(cmd);
@@ -576,12 +587,14 @@ int wait_flash_message(int fd,int ntimes) {
 			continue;
 		}
 
-		if (cmd->cmd[0]!=0x18) {
-			printf("wait_flash_message: got unexpected command type 0x%2.2x\n",cmd->cmd[0]);
+		if ((cmd->cmd[0]!=0x18)&&(cmd->cmd[1]!=0x05)) {
+			printf("wait_flash_message: got unexpected command type 0x%2.2x 0x%2.2x\n",cmd->cmd[1],cmd->cmd[0]);
 			destroy_k5_struct(cmd);
 			continue;
 		}
-		if (cmd->len!=36) {
+		/* 36 is normal length, 22 is sent by some LSENG UV-K5 clone, 
+		 * 20 is sent by some other version, so just use an arbitrarily chosen range */
+		if ((cmd->len<18)||(cmd->len>50)) {
 			printf("wait_flash_message: got unexpected command length %i\n",cmd->len);
 			destroy_k5_struct(cmd);
 			continue;
@@ -598,11 +611,6 @@ int wait_flash_message(int fd,int ntimes) {
 		 *  0x000020: 00 00 00 20                                       ...                
 		 */
 
-		if ((cmd->cmd[2]!=0x20)||(cmd->cmd[3]!=0x0)||(cmd->cmd[4]!=0x1)||(cmd->cmd[5]!=0x2)||(cmd->cmd[6]!=0x2)) {
-			printf("wait_flash_message: got unexpected packet contents\n");
-			destroy_k5_struct(cmd);
-			continue;
-		}
 
 		/* all is good, so break */
 		ok=1; 	break;
@@ -631,13 +639,17 @@ int wait_flash_message(int fd,int ntimes) {
  * unobfuscated firmware will have the version number in 16 bytes at 0x2000
  * probably these bytes are sent.
  *
- * currently this is hardcoded to 2.01.23
+ * the vendor flasher sends the real version,  something like  2.01.23
+ * if we send a * as the first character, then all known bootloaders
+ * will accept it
  */
-int k5_send_flash_version_message(int fd) {
+int k5_send_flash_version_message(int fd,char *version_string) {
 
 	int r;
 	struct k5_command *cmd;
-	unsigned char uvk5_flash_version[]={ 0x30, 0x5, 0x10, 0x0, '2', '.', '0', '1', '.', '2', '3', 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0};
+	//unsigned char uvk5_flash_version[]={ 0x30, 0x5, 0x10, 0x0, '2', '.', '0', '1', '.', '2', '3', 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0};
+	unsigned char uvk5_flash_version[]={ 0x30, 0x5, 0x10, 0x0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0};
+	strncpy ((char *)&uvk5_flash_version+4,flash_version_string,8);
 	r=k5_send_buf(fd,uvk5_flash_version,sizeof(uvk5_flash_version));
 	if (!r) return(0);
 
@@ -651,7 +663,7 @@ int k5_send_flash_version_message(int fd) {
 	return(1);
 }
 
-int k5_writeflash(int fd, unsigned char *buf, int  len, int offset, int fw_size_blocks)
+int k5_writeflash(int fd, unsigned char *buf, int  len, int offset,int max_flash_addr)
 {
 	int l;
 	unsigned char writeflash[512];
@@ -679,8 +691,10 @@ int k5_writeflash(int fd, unsigned char *buf, int  len, int offset, int fw_size_
 
 	writeflash[8]=(offset>>8)&0xff;
 	writeflash[9]=offset&0xff;
-	writeflash[10]=fw_size_blocks&0xff; // bootloader probably uses this to determinate total fw len (in flash pages)
+	//writeflash[10]=0xe6;
+	writeflash[10]=(max_flash_addr>>8)&0xff;
 	writeflash[11]=0x00;
+	//writeflash[11]=max_flash_addr&0xff;
 	writeflash[12]=len&0xff;
 	writeflash[13]=(len>>8)&0xff;
 	writeflash[14]=0x00;
@@ -707,7 +721,7 @@ int k5_writeflash(int fd, unsigned char *buf, int  len, int offset, int fw_size_
 		}
 		/* we're still getting "i'm in flash mode packets", can happen after the first flash command, ignore it */
 		if ((cmd->cmd[0]==0x18)&&(cmd->cmd[1]==0x05)&&(cmd->cmd[2]==0x20)&&(cmd->cmd[3]==0x0)&&(cmd->cmd[4]==0x1)&&(cmd->cmd[5]==0x2)&&(cmd->cmd[6]==0x2)) {
-		if (verbose>1)  printf("&&&&|  ignoring \"i'm in flash mode\" packet\n");
+			if (verbose>1)  printf("&&&&|  ignoring \"i'm in flash mode\" packet\n");
 			destroy_k5_struct(cmd);
 			continue;
 		}
@@ -740,13 +754,14 @@ void helpme()
 			"cmdline opts:\n"
 			"-f <file>\tfilename that contains the eeprom dump (default: " DEFAULT_FILE_NAME ")\n"
 			"-b <file>\tfilename that contains the raw flash image (default " DEFAULT_FLASH_NAME ")\n"
-			"-Y \tincrease \"I know what i'm doing\" value, to enable functionality likely to break the radio\n"
-			"-D\twait for the message from the radio flasher, print it's version\n"
-			"-F\tflash firmware, WARNING: this will likely brick your radio!\n"
+			"-Y \tincrease \"I know what I'm doing\" value, to enable functionality likely to break the radio\n"
+			"-D \twait for the message from the radio flasher, print it's version\n"
+			"-F \tflash firmware, WARNING: this will likely brick your radio!\n"
+			"-M <ver> \tSet the firmware major version to <ver> during the flash process (default: " DEFAULT_FLASH_VERSION ")\n"
 			"-r \tread eeprom\n"
 			"-w \twrite eeprom like the original software does\n"
-			"-W \twrite most of the eeprom (but without what i think is calibration data)\n"
-			"-B \twrite ALL of the eeprom (the \"brick my radio\" mode)\n"
+			"-W \twrite most of the EEPROM (but without what I think is calibration data)\n"
+			"-B \twrite ALL of the EEPROM (the \"brick my radio\" mode)\n"
 			"-p <port>\tdevice name (default: " DEFAULT_SERIAL_PORT ")\n"
 			"-s <speed>\tserial speed (default: 38400, the UV-K5 doesn't accept any other speed)\n"
 			"-h \tprint this help\n"
@@ -803,15 +818,11 @@ static speed_t baud_to_speed_t(int baud)
 void parse_cmdline(int argc, char **argv)
 {
 	int opt;
-	int tmpval;
 
-int res;
 	/* cmdline opts:
 	 * -f <file>
 	 * -b <flash file>
 	 * -F (flash firmware)
-	 * -O (hex offset)
-	 * -L (hex length)
 	 * -r (read)
 	 * -w (write)
 	 * -p <port>
@@ -823,7 +834,7 @@ int res;
 	 * -Y (i know what i'm doing)
 	 */
 
-	while ((opt=getopt(argc,argv,"f:rwWBp:s:hvDFYb:L:O:"))!=EOF)
+	while ((opt=getopt(argc,argv,"f:rwWBp:s:hvDFYb:M:"))!=EOF)
 	{
 		switch (opt)
 		{
@@ -852,19 +863,8 @@ int res;
 			case 'b':
 				flash_file=optarg;
 				break;
-			case 'O':
-				res=sscanf(optarg,"%x",&write_offset);
-				if (res!=1) {
-					fprintf(stderr,"ERROR, could not parse offset %s\n",optarg);
-					exit(1);
-				}
-				break;
-			case 'L':
-				res=sscanf(optarg,"%x",&write_length);
-				if (res!=1) {
-					fprintf(stderr,"ERROR, could not parse length %s\n",optarg);
-					exit(1);
-				}
+			case 'M':
+				strncpy(flash_version_string,optarg,sizeof(flash_version_string)-1);
 				break;
 			case 'W':
 				mode=MODE_WRITE_MOST;
@@ -935,6 +935,14 @@ int k5_prepare(int fd) {
 	cmd=k5_receive(fd,10000);
 	if (!cmd) return(0);
 
+	/* this is a bit problem with people trying to read the radio config in firmware flash mode,
+	 * don't know why people do this, but they do it quite often */
+	if ((cmd->cmd[0]==0x18)&&(cmd->cmd[1]==0x05)) {
+		fprintf(stderr,"\nWARNING: this radio is in firmware flash mode (PTT + turn on).\n"
+				"Please have the radio in normal mode to read the EEPROM\n\n");
+		return(0);
+	}
+	printf ("cmd: %2.2x %2.2x ok:%i\n",cmd->cmd[0],cmd->cmd[1],cmd->crcok);
 	printf("******  Connected to firmware version: [%s]\n",(cmd->cmd)+4);
 	destroy_k5_struct(cmd);
 
@@ -947,7 +955,8 @@ int main(int argc,char **argv)
 	unsigned char eeprom[UVK5_EEPROM_SIZE];
 	unsigned char flash[UVK5_MAX_FLASH_SIZE];
 	int flash_length;
-	int flash_length2;
+	int flash_max_addr;
+	int flash_max_block_addr;
 	int i,r,j,len;
 
 	printf (VERSION "\n\n"); 
@@ -995,45 +1004,51 @@ int main(int argc,char **argv)
 
 			ffd=open(flash_file,O_RDONLY);
 			if (ffd<0) {
-				fprintf(stderr,"open %s error %d %s\n", file, errno, strerror(errno));
+				fprintf(stderr,"open %s error %d %s\n", flash_file, errno, strerror(errno));
 				exit(1);
 			}
 			flash_length=read(ffd,(unsigned char *)&flash,UVK5_MAX_FLASH_SIZE);
-			/* arbitrary limit do that someone doesn't flash some random short file */
-			if (flash_length<50000) {
-				fprintf(stderr,"Failed to read whole eeprom from file %s (read %i), file too short or some other error\n",file,flash_length);
-				exit(1);
-			}
-			if ((write_length>0)&&((write_length+write_offset)>=UVK5_MAX_FLASH_SIZE))  {
-				fprintf(stderr,"write_length (%d) + write_offset (%d) is bigger than the flash size (%d)\n", write_length, write_offset, UVK5_MAX_FLASH_SIZE);
-				exit(1);
-			}
 			close(ffd);
 
+			/* arbitrary limit do that someone doesn't flash some random short file */
+			if ((i_know_what_im_doing<5)&&(flash_length<50000)) {
+				fprintf(stderr,"Failed to read whole EEPROM from file %s (read %i), file too short or some other error\n",file,flash_length);
+				if (flash_length>0) {
+					fprintf(stderr,"This failsafe is here so that people don't mistake config files with flash.\nIt can be ignored with an 'i know what i'm doing' value of at least 5\n");
+				}
+				exit(1);
+			}
 			if (verbose>0) { printf ("Read file %s success\n",flash_file); }
+			flash_max_addr=flash_length;
 
+			if (write_length>0)  flash_max_addr=write_offset+write_length;
+			if (flash_max_addr>flash_length) flash_max_addr=flash_length;
+
+			if (flash_max_addr&0xff) {
+				flash_max_block_addr=(flash_max_addr&0xff00)+UVK5_FLASH_BLOCKSIZE;
+			} else {
+				flash_max_block_addr=(flash_max_addr&0xff00);
+			}
+
+			printf("Writing blocks from address 0x%x until 0x%x, firmware size is 0x%x\n",write_offset,flash_max_block_addr,flash_length);
+
+
+			if (flash_max_block_addr>UVK5_MAX_FLASH_SIZE)  {
+				fprintf(stderr,"flash length 0x%x is greater than max flash size 0x%x\n",flash_max_block_addr,UVK5_MAX_FLASH_SIZE);
+				exit(1);
+			}
 
 			r=wait_flash_message(fd,10000);
 			if (!r) exit(0);
 
-			k5_send_flash_version_message(fd);
+			k5_send_flash_version_message(fd,flash_version_string);
 
-			/* for(i=0; i<flash_length; i+=UVK5_FLASH_BLOCKSIZE) */
-			flash_length2=flash_length;
-			if (write_length>0) {
-				flash_length2=write_offset+write_length;
-				if (flash_length2%UVK5_FLASH_BLOCKSIZE>0) { 
-					flash_length2=flash_length2-flash_length2%UVK5_FLASH_BLOCKSIZE+UVK5_FLASH_BLOCKSIZE; 
-				}
-				if (flash_length2>flash_length) flash_length2=flash_length;
-				printf("Writing blocks from address 0x%x until 0x%x\n",write_offset,flash_length2);
-			}
-			for(i=write_offset; i<flash_length2; i+=UVK5_FLASH_BLOCKSIZE)
+			for(i=write_offset; i<flash_max_addr; i+=UVK5_FLASH_BLOCKSIZE)
 			{
-				len=flash_length-i;
+				len=flash_max_addr-i;
 				if (len>UVK5_FLASH_BLOCKSIZE) len=UVK5_FLASH_BLOCKSIZE;
 
-				r=k5_writeflash(fd, (unsigned char *)&flash+i,len,i,(flash_length+0xFF)/0x100);
+				r=k5_writeflash(fd, (unsigned char *)&flash+i,len,i,flash_max_block_addr);
 
 				printf("*** FLASH at 0x%4.4x length 0x%4.4x  result=%i\n",i,len,r);
 				if (!r) {
@@ -1078,7 +1093,7 @@ int main(int argc,char **argv)
 				}
 			}
 			close(fd);
-			if (verbose>0) { printf("\rSucessfuly read eeprom\n"); }
+			if (verbose>0) { printf("\rSuccessfully read EEPROM\n"); }
 			if (verbose>2) { hdump((unsigned char *)&eeprom,UVK5_EEPROM_SIZE); }
 
 			write_file(file,(unsigned char *)&eeprom,UVK5_EEPROM_SIZE);
@@ -1089,7 +1104,7 @@ int main(int argc,char **argv)
 		case MODE_WRITE_MOST:
 		case MODE_WRITE_ALL:
 			if ((mode==MODE_WRITE_ALL)&&(i_know_what_im_doing<1)) {
-				printf("ERROR: the \"I know what i'm doing\" value has to be at least 1 to confirm that you know what you're doing\n");
+				printf("ERROR: the \"I know what I'm doing\" value has to be at least 1 to confirm that you know what you're doing\n");
 				exit(0);
 			}
 
@@ -1101,7 +1116,7 @@ int main(int argc,char **argv)
 			}
 			r=read(ffd,(unsigned char *)&eeprom[i],UVK5_EEPROM_SIZE);
 			if (r!=UVK5_EEPROM_SIZE) {
-				fprintf(stderr,"Failed to read whole eeprom from file %s, file too short?\n",file);
+				fprintf(stderr,"Failed to read whole EEPROM from file %s, file too short?\n",file);
 				exit(1);
 			}
 			close(ffd);
@@ -1145,7 +1160,7 @@ int main(int argc,char **argv)
 				}
 			}
 			k5_reset(fd);
-			if (verbose>0) { printf("\rSucessfuly wrote eeprom\n"); }
+			if (verbose>0) { printf("\rSuccessfully wrote EEPROM\n"); }
 
 
 			break;
