@@ -949,6 +949,25 @@ int k5_prepare(int fd) {
 	return(1);
 }
 
+
+void print_progress(size_t count, size_t max) {
+	const int bar_width = 50;
+
+    float progress = (float) count / max;
+    int bar_length = progress * bar_width;
+
+    printf("\rFlash progress: [");
+    for (int i = 0; i < bar_length; ++i) {
+        printf("#");
+    }
+    for (int i = bar_length; i < bar_width; ++i) {
+        printf(" ");
+    }
+    printf("] %.2f%%", progress * 100);
+
+    fflush(stdout);
+}
+
 int main(int argc,char **argv)
 {
 	int fd,ffd;
@@ -1042,7 +1061,9 @@ int main(int argc,char **argv)
 			if (!r) exit(0);
 
 			k5_send_flash_version_message(fd,flash_version_string);
-
+			//printf("debug %i:%i:%i \n", write_offset, flash_max_addr, UVK5_FLASH_BLOCKSIZE);
+			printf("\n");
+			print_progress(0, flash_max_addr / UVK5_FLASH_BLOCKSIZE);
 			for(i=write_offset; i<flash_max_addr; i+=UVK5_FLASH_BLOCKSIZE)
 			{
 				len=flash_max_addr-i;
@@ -1050,12 +1071,16 @@ int main(int argc,char **argv)
 
 				r=k5_writeflash(fd, (unsigned char *)&flash+i,len,i,flash_max_block_addr);
 
-				printf("*** FLASH at 0x%4.4x length 0x%4.4x  result=%i\n",i,len,r);
+				//printf("\r*** FLASH at 0x%4.4x length 0x%4.4x  result=%i ",i,len,r);
+				//fflush(stdout);
+				print_progress(i / UVK5_FLASH_BLOCKSIZE, flash_max_addr / UVK5_FLASH_BLOCKSIZE);
+
 				if (!r) {
-					printf("Stopping flash due to ERROR!!!\n");
+					printf("\nStopping flash due to ERROR at 0x%4.4x length 0x%4.4x !!!\n", i, len);
 					break;
 				}
 			}
+			printf("\n\n");
 			exit(0);
 
 	}
